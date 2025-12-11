@@ -5,20 +5,19 @@ import math
 from flask import Flask, request, jsonify
  
 # --- CONFIGURATION & PATH SETUP ---
-# Ensure these match your actual folder structure
 sys.path.append(os.path.abspath("Mock_Aerodrop/modules"))
 sys.path.append(os.path.abspath("3D data extraction"))
  
 try:
     from analyzer import StructuralBrain
+    # We use the fallback_pipeline (SciPy) as the standard processor 
+    # because it is lightweight and robust for servers.
     from unified_inspector import fallback_pipeline 
 except ImportError as e:
     print(f"CRITICAL ERROR: Could not import modules.\n{e}")
     sys.exit(1)
  
 app = Flask(__name__)
- 
-# Folder where you put your .ply files
 UPLOAD_FOLDER = 'uploads'
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
  
@@ -28,48 +27,44 @@ class PipelineService:
  
     def parse_pod_packet(self, raw_string, gas_baseline=100.0):
         """
-        Parses the 7-Field Arduino String:
-        Input: "TX: POD1,1,13.36,0.58,0.037,63.4,32.1"
-        Mapping:
-          [2] Roll   -> Tilt
-          [3] Pitch  -> Tilt
-          [4] Vib(G) -> Vib(mm/s)
-          [5] Gas    -> Risk %
-          [6] Temp   -> Value (New!)
+        STRICT PARSER: Expects exactly 7 fields.
+        Format: "TX: POD_ID, State, Roll, Pitch, Vib(G), Gas, Temp"
+        Example: "TX: POD2,1,13.36,0.58,0.037,63.4,32.1"
         """
         try:
             clean = raw_string.strip().replace("TX: ", "")
             parts = clean.split(',')
             
-            # Need at least 6 fields (Old format)
-            if len(parts) < 6: return None
+            # STRICT CHECK: Must have at least 7 fields (ID...Temp)
+            if len(parts) < 7: 
+                print(f"[ERROR] Packet too short. Received {len(parts)} fields, expected 7.")
+                return None
  
-            # --- EXTRACT RAW VALUES ---
+            # --- 1. IDENTIFICATION ---
+            pod_id = parts[0]  # Capture dynamic ID (e.g., POD2)
+ 
+            # --- 2. RAW VALUES (Guaranteed to exist) ---
             roll = float(parts[2])
             pitch = float(parts[3])
             raw_vib_g = float(parts[4])
             gas_kohm = float(parts[5])
-            
-            # CHECK FOR 7th FIELD (TEMPERATURE)
-            if len(parts) >= 7:
-                temp_c = float(parts[6]) # Use real value from Pod
-            else:
-                temp_c = 25.0            # Fallback if missing
+            temp_c = float(parts[6])  # No fallback: Always read index 6
  
-            # --- CONVERSIONS ---
-            # 1. TILT (Max deviation)
+            # --- 3. CONVERSIONS ---
+            # Tilt (Max deviation)
             tilt_deg = max(abs(roll), abs(pitch))
             
-            # 2. VIBRATION (G -> mm/s @ 15Hz)
+            # Vibration (G -> mm/s @ 15Hz)
             accel_mm_s2 = raw_vib_g * 9806.65
             vib_mm_s = accel_mm_s2 / (2 * 3.14159 * 15)
  
-            # 3. GAS (Drop %)
+            # Gas (Drop %)
             gas_drop = 0.0
             if gas_baseline > 0:
                 gas_drop = max(0.0, (gas_baseline - gas_kohm) / gas_baseline)
  
             return {
+                "pod_id": pod_id,
                 "vib_mm_s": round(vib_mm_s, 2),
                 "tilt_deg": round(tilt_deg, 2),
                 "gas_drop": round(gas_drop, 2),
@@ -80,16 +75,15 @@ class PipelineService:
             return None
  
     def process_request(self, ply_path, manual_inputs, raw_packet):
-        # --- STEP 1: STATIC 3D ANALYSIS (.ply) ---
-        # Opens the file and calculates geometry metrics
+        # --- STEP 1: STATIC 3D ANALYSIS ---
         print(f"[API] Analyzing 3D File: {ply_path}")
         scan_report = fallback_pipeline(ply_path, voxel_size=0.02)
         
-        # A. Get Metrics
+        # Extract Static Metrics
         static_tilt = scan_report.get('max_tilt_degrees', 0.0)
         buckling_cm = scan_report.get('deflection', {}).get('measured_deflection_mm_98pct', 0.0) / 10.0
         
-        # B. Calculate Support Ratio (Points on Wall / Total Points)
+        # Calculate Support Ratio
         #
         try:
             raw_pts = scan_report.get('cleaned_points', 1)
@@ -98,7 +92,7 @@ class PipelineService:
         except:
             static_support_ratio = 1.0
  
-        # C. Calculate Crack Proxy (Surface Variance)
+        # Calculate Crack Proxy
         #
         frac_critical = scan_report.get('normal_variation_stats', {}).get('frac_var_gt_0.18', 0.0)
         static_crack_mm = min(10.0, round(frac_critical * 6.0, 3))
@@ -106,7 +100,7 @@ class PipelineService:
         # --- STEP 2: LIVE POD PARSING ---
         live_data = self.parse_pod_packet(raw_packet)
         if not live_data:
-            raise ValueError("Invalid Packet Format")
+            raise ValueError("Invalid Packet Format: Must contain 7 fields (incl. Temp)")
  
         # --- STEP 3: CONTEXT & FRAGILITY ---
         #
@@ -131,19 +125,19 @@ class PipelineService:
             scan_penalties.append(f"Buckling {buckling_cm:.1f}cm (>10.0)")
  
         # --- STEP 4: PREDICTION ---
-        # MERGE: Live Data + Static 3D Data
         combined_data = {
-            'vib_mm_s': live_data['vib_mm_s'],       # From Pod
-            'tilt_deg': live_data['tilt_deg'],       # From Pod (Live)
-            'gas_drop': live_data['gas_drop'],       # From Pod
-            'temp_c': live_data['temp_c'],           # From Pod (Now 32.1)
-            'crack_mm': static_crack_mm,             # From .ply
-            'support_ratio': static_support_ratio    # From .ply
+            'vib_mm_s': live_data['vib_mm_s'],
+            'tilt_deg': live_data['tilt_deg'],
+            'gas_drop': live_data['gas_drop'],
+            'temp_c': live_data['temp_c'],           # Guaranteed Real Value
+            'crack_mm': static_crack_mm,
+            'support_ratio': static_support_ratio
         }
  
         status, eff_vib, score, advice, lbc_info = self.brain.predict(combined_data, alpha, tags)
  
         return {
+            "source_pod_id": live_data['pod_id'], # Returns the ID (e.g., POD2)
             "status": status,
             "final_score": score,
             "advice": advice,
@@ -166,35 +160,26 @@ pipeline = PipelineService()
  
 @app.route('/api/assess', methods=['POST'])
 def assess_structure():
-    """
-    Endpoint: 
-    1. Looks for 'filename' in 'uploads/'
-    2. Takes 'packet' string
-    3. Takes 'manual_config' JSON
-    """
     if not request.is_json:
         return jsonify({"error": "Request must be JSON"}), 400
     
     data = request.get_json()
-    
-    # Extract Inputs
-    packet = data.get('packet')       # "TX: POD1,..."
-    filename = data.get('filename')   # "cloud.ply"
-    manual_config = data.get('manual_config') # { "wall_type":... }
+    packet = data.get('packet')
+    filename = data.get('filename')
+    manual_config = data.get('manual_config')
  
+    # Strict Input Check
     if not all([packet, filename, manual_config]):
         return jsonify({"error": "Missing packet, filename, or manual_config"}), 400
  
-    # Locate File
     filepath = os.path.join(UPLOAD_FOLDER, filename)
     if not os.path.isfile(filepath):
         return jsonify({"error": f"File '{filename}' not found in {UPLOAD_FOLDER}"}), 404
  
     try:
-        # Run Pipeline
         result = pipeline.process_request(filepath, manual_config, packet)
         
-        # Optional: Clean up side-effect files from unified_inspector
+        # Clean up side-effect files
         for junk in ["cleaned_cloud.ply", "wall_inliers.ply", "unified_report.json"]:
             if os.path.exists(junk):
                 os.remove(junk)
